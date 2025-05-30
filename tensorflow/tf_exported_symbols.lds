@@ -6,6 +6,7 @@
 *TF_*
 *Eager*
 *TFE_*
+*TFI_*
 *nsync_*
 *stream_executor*
 *xla*
