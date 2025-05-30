@@ -121,7 +121,7 @@ Status LoadMetagraphIntoSession(const SessionOptions& session_options,
 Status LoadSavedModel(const SessionOptions& session_options,
                       const RunOptions& run_options, const string& export_dir,
                       const std::unordered_set<string>& tags,
-                      SavedModelBundle* bundle);
+                      SavedModelBundle* const bundle, const char* default_device);
 
 /// Loads a SavedModel from the specified export directory. The MetaGraphDef
 /// to be loaded is identified by the supplied tags, corresponding exactly to

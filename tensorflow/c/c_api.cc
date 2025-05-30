@@ -2247,7 +2247,8 @@ TF_Session* TF_NewSession(TF_Graph* graph, const TF_SessionOptions* opt,
 TF_Session* TF_LoadSessionFromSavedModel(
     const TF_SessionOptions* session_options, const TF_Buffer* run_options,
     const char* export_dir, const char* const* tags, int tags_len,
-    TF_Graph* graph, TF_Buffer* meta_graph_def, TF_Status* status) {
+    TF_Graph* graph, TF_Buffer* meta_graph_def, const char* default_device,
+    TF_Status* status) {
 // TODO(sjr): Remove the IS_MOBILE_PLATFORM guard. This will require ensuring
 // that the tensorflow/cc/saved_model:loader build target is mobile friendly.
 #if defined(IS_MOBILE_PLATFORM) || defined(IS_SLIM_BUILD)
@@ -2278,7 +2279,7 @@ TF_Session* TF_LoadSessionFromSavedModel(
   tensorflow::SavedModelBundle bundle;
   status->status =
       tensorflow::LoadSavedModel(session_options->options, run_options_proto,
-                                 export_dir, tag_set, &bundle);
+                                 export_dir, tag_set, &bundle, default_device);
   if (!status->status.ok()) return nullptr;
 
   // Create a TF_Graph from the MetaGraphDef. This is safe as long as Session
@@ -2817,6 +2818,210 @@ void TF_RegisterFilesystemPlugin(const char* plugin_filename,
 #else
   status->status = tensorflow::RegisterFilesystemPlugin(plugin_filename);
 #endif  // defined(IS_MOBILE_PLATFORM) || defined(IS_SLIM_BUILD)
+}
+
+
+// --------------------------------------------------------------------------
+// ID Vision extensions
+
+void TFI_SetStructOptions(TF_SessionOptions* options,
+                          const TFI_StructSessionOptions* structOptions) {
+  tensorflow::ConfigProto config;
+  tensorflow::GPUOptions* gpuOptions = config.mutable_gpu_options();
+  tensorflow::OptimizerOptions* optimizerOptions =
+      config.mutable_graph_options()->mutable_optimizer_options();
+  tensorflow::ConfigProto_Experimental* experimentalOptions =
+      config.mutable_experimental();
+
+  //
+  // Gpu options
+  //
+
+  // Use GPU
+  auto deviceMap = config.mutable_device_count();
+  (*deviceMap)["CPU"] = 1;
+  if (structOptions->GpuOptions.UseGpu) {
+    (*deviceMap)["GPU"] = 100;
+  } else {
+    (*deviceMap)["GPU"] = 0;
+  }
+
+  // UseGpuFraction
+  gpuOptions->set_per_process_gpu_memory_fraction(
+      structOptions->GpuOptions.UseGpuFraction);
+
+  // Allow growth
+  gpuOptions->set_allow_growth(structOptions->GpuOptions.AllowGrowth);
+
+  // Allow soft placement
+  config.set_allow_soft_placement(structOptions->GpuOptions.AllowSoftPlacement);
+
+  // Log device placement
+  config.set_log_device_placement(structOptions->GpuOptions.LogDevicePlacement);
+
+  //
+  // Graph options
+  //
+
+  // GlobalJitLevel
+  tensorflow::OptimizerOptions_GlobalJitLevel jitLevel = tensorflow::
+      OptimizerOptions_GlobalJitLevel::OptimizerOptions_GlobalJitLevel_DEFAULT;
+  if (structOptions->GraphOptions.GlobalJitLevel == 0) {
+    jitLevel = tensorflow::OptimizerOptions_GlobalJitLevel::
+        OptimizerOptions_GlobalJitLevel_OFF;
+  } else if (structOptions->GraphOptions.GlobalJitLevel == 1) {
+    jitLevel = tensorflow::OptimizerOptions_GlobalJitLevel::
+        OptimizerOptions_GlobalJitLevel_ON_1;
+  } else if (structOptions->GraphOptions.GlobalJitLevel == 2) {
+    jitLevel = tensorflow::OptimizerOptions_GlobalJitLevel::
+        OptimizerOptions_GlobalJitLevel_ON_2;
+  }
+  optimizerOptions->set_global_jit_level(jitLevel);
+  optimizerOptions->set_cpu_global_jit(structOptions->GraphOptions.CpuGlobalJit);
+
+  // OptimizeForStaticGraph
+  experimentalOptions->set_optimize_for_static_graph(
+      structOptions->GraphOptions
+          .OptimizeForStaticGraph);  // Experimental option
+
+  // CommonSubexpressionElimination;
+  optimizerOptions->set_do_common_subexpression_elimination(
+      structOptions->GraphOptions.DoCommonSubexpressionElimination);
+
+  // DoConstantFolding
+  optimizerOptions->set_do_constant_folding(
+      structOptions->GraphOptions.DoConstantFolding);
+
+  // DoFunctionInlining
+  optimizerOptions->set_do_function_inlining(
+      structOptions->GraphOptions.DoFunctionInlining);
+
+  // Mlir graph optimization
+  experimentalOptions->set_enable_mlir_graph_optimization(
+      structOptions->GraphOptions.MlirGraphOptimization);
+
+  //
+  // General options
+  //
+
+  // OperationTimeout
+  config.set_operation_timeout_in_ms(structOptions->OperationTimeout);
+
+  // IntraOpParallelismThreads
+  config.set_intra_op_parallelism_threads(
+      structOptions->IntraOpParallelismThreads);
+
+  // InterOpParallelismThreads
+  config.set_inter_op_parallelism_threads(
+      structOptions->InterOpParallelismThreads);
+
+  // Load config into session options
+  options->options.config = config;
+
+  // 20240710 - jvalles
+  // We have encountered an exception with message only runnning Debug mode:
+  // (bytes_produced_by_serialization) == (byte_size_before_serialization): Byte size calculation and serialization were inconsistent.
+  // This may indicate a bug in protocol buffers or it may be caused by concurrent modification of tensorflow.ConfigProto."
+  // -> This was caused due to not updating the signature of the struct TFI_StructSessionOptions, using an old signature in brain_server.
+  // The bottom reason was that the file c_api.h had not been updated in the compiled tensorflow (only updating the dll).
+}
+
+TF_Buffer* TFI_CreateRunOptions(TFI_StructRunOptions* runOptionsStruct) {
+  tensorflow::RunOptions newRunOptions;
+
+  // Enable or disable full trace
+  if (runOptionsStruct->EnableFullTrace) {
+    newRunOptions.set_trace_level(tensorflow::RunOptions_TraceLevel_FULL_TRACE);
+  } else {
+    newRunOptions.set_trace_level(tensorflow::RunOptions_TraceLevel_NO_TRACE);
+  }
+
+  // Set run timeout
+  if (runOptionsStruct->RunTimeout > 0) {
+    newRunOptions.set_timeout_in_ms(runOptionsStruct->RunTimeout);
+  }  
+
+  // Previous method to serialize - jvalles 20240710
+  // // Serialize run options to protobuf
+  // auto buffer = TF_NewBuffer();
+  // buffer->length = newRunOptions.ByteSizeLong();
+  // void* data = new uint8_t[buffer->length];
+  // newRunOptions.SerializeToArray(data, buffer->length);
+  // buffer->data = data;
+  // // Return buffer
+  // return buffer;
+
+  TF_Buffer* ret = TF_NewBuffer();
+  TF_CHECK_OK(MessageToBuffer(newRunOptions, ret));
+  return ret;
+}
+
+void TFI_AddDebugLog(const char* msg) {
+#if !defined(IS_MOBILE_PLATFORM) && !defined(IS_SLIM_BUILD)
+  // Log the message with the level ERROR
+  LOG(ERROR) << std::string(msg);
+  // return tensorflow::logging::LogToListeners(msg);
+#endif  // !defined(IS_MOBILE_PLATFORM) && !defined(IS_SLIM_BUILD)
+}
+
+bool TFI_WriteStepStatsToFile(TF_Buffer* runMetadata, const char* filePath) {
+  // Convert buffer into a metadata protobuf
+  tensorflow::RunMetadata runMetadataProto;
+  runMetadataProto.ParseFromArray(runMetadata->data, runMetadata->length);
+
+  // Get step stats
+  const tensorflow::StepStats& stepStatsProto = runMetadataProto.step_stats();
+
+  // Write serialized protobuf to provided filepath and return if Ok
+  std::ofstream out(filePath, std::ofstream::binary | std::ofstream::out);
+  if (out.is_open()) {
+    out << stepStatsProto.SerializeAsString();
+    out.close();
+    return true;
+  } else {
+    return false;
+  }
+}
+
+class TFCustomLogSink : public tensorflow::TFLogSink {
+ public:
+  // Construct a log sink from a C listener
+  TFCustomLogSink(void (*listener)(const int&, const char*))
+      : listener_(std::move(listener)) {}
+
+  // The pure virtual send function on the sink calls the listener
+  void Send(const tensorflow::TFLogEntry& entry) {
+    auto log_severity = static_cast<int>(entry.log_severity());
+    auto log_message = entry.ToString();
+    this->listener_(log_severity, log_message.c_str());
+  }
+
+ private:
+  void (*listener_)(const int&, const char*);
+};
+
+tensorflow::TFLogSink* current_sink = nullptr;
+
+void TFI_AddDebugLogSink(void (*listener)(const int&, const char*)) {
+  // First remove any existing log sink
+  TFI_RemoveDebugLogSink();
+
+  // Create log sink
+  current_sink = new TFCustomLogSink(listener);
+  tensorflow::TFAddLogSink(current_sink);
+}
+
+bool TFI_RemoveDebugLogSink() {
+  if (current_sink != nullptr) {
+    // Try to remove the only log sink that there is
+    tensorflow::TFRemoveLogSink(current_sink);
+    current_sink = nullptr;
+    return true;
+  } 
+  else
+  {
+    return false;
+  }
 }
 
 }  // end extern "C"
